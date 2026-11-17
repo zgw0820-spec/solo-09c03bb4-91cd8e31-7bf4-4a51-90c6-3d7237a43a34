@@ -222,6 +222,48 @@ def test_crash_and_takeover_matches_uninterrupted(tmp_path, uninterrupted):
         assert starts[1]["detail"]["resumed_from_step"] == at_crash["completed_steps"]
 
 
+def test_slow_batch_does_not_livelock_and_matches_uninterrupted(tmp_path, uninterrupted):
+    """A batch longer than the lease must keep training under one owner.
+
+    Before the fix both workers stole the lease from each other mid-batch and
+    the job never left step 0.  With the renewal watchdog, the live holder keeps
+    its lease across arbitrarily long batches, finishes the job, and the final
+    weights are bit-identical to the uninterrupted reference run.
+    """
+    db = tmp_path / "training.db"
+    # Every batch (1.2s) takes twice as long as the lease (0.6s).
+    slow_env = {
+        "TRAINING_LEASE_SECONDS": "0.6",
+        "TRAINING_HEARTBEAT_INTERVAL": "0.15",
+        "TRAINING_BATCH_DELAY_SECONDS": "1.2",
+    }
+    with Server(db, free_port()) as server:
+        job = server.post("/jobs", dataset())
+        worker_a = start_worker(db, "worker-a", **slow_env)
+        worker_b = start_worker(db, "worker-b", **slow_env)
+        try:
+            final = wait_completed(server, job["job_id"], timeout=120)
+        finally:
+            stop_worker(worker_b)
+            stop_worker(worker_a)
+
+        assert final["completed_steps"] == final["total_steps"]
+        assert final["final_weights"] == uninterrupted["final_weights"]
+        assert final["loss"] == uninterrupted["loss"]
+        assert final["momentum_velocity"] == uninterrupted["momentum_velocity"]
+
+        checkpoints = server.get(f"/jobs/{job['job_id']}/checkpoints")
+        assert [c["step"] for c in checkpoints] == list(
+            range(1, final["total_steps"] + 1)
+        )
+        # The watchdog held the lease throughout: exactly one owner and one
+        # epoch for the whole job - no mid-batch takeover ping-pong.  Either
+        # worker may win the initial claim.
+        assert len({c["worker_id"] for c in checkpoints}) == 1
+        assert {c["lease_epoch"] for c in checkpoints} == {1}
+        assert server.get("/workers")["leases"] == []
+
+
 def test_late_worker_cannot_regress_or_false_complete(tmp_path):
     """A is suspended between batches until its lease expires; B takes over.
 

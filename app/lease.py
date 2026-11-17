@@ -10,6 +10,14 @@ inside the same ``BEGIN IMMEDIATE`` transaction that writes the checkpoint.  A
 worker whose lease was stolen therefore cannot write anything, even if its
 process is alive and still believes it owns the job - it cannot roll the
 breakpoint back, and it cannot report a false completion.
+
+A slow batch (one that takes longer than ``lease_seconds``) must not make a
+live holder look dead.  While training, a background watchdog thread renews the
+lease continuously via :func:`renew_with_heartbeat`, so a batch may take
+arbitrarily long without ever expiring the lease.  Renewal is suspended on
+purpose between batches (the demo pause hook) and stops entirely when the
+process exits, which is what still lets another worker take over after a real
+freeze or crash.
 """
 from __future__ import annotations
 
@@ -111,6 +119,32 @@ def renew(path: Path | str, lease: Lease, lease_seconds: float) -> bool:
         ).fetchone()
         if row is None or row["worker_id"] != lease.worker_id or int(row["epoch"]) != lease.epoch:
             return False
+        conn.execute("UPDATE leases SET heartbeat_at=? WHERE job_id=?", (now, lease.job_id))
+        return True
+
+
+def renew_with_heartbeat(
+    path: Path | str, lease: Lease, worker_id: str, status: str
+) -> bool:
+    """Refresh the worker heartbeat and renew the lease in one transaction.
+
+    Used by the worker's background watchdog while a batch is in flight, so a
+    batch that takes longer than the lease timeout can never make a live worker
+    appear dead.  The renewal is still fenced by ``(worker_id, epoch)``: when
+    another instance has taken over, this returns ``False`` and writes nothing.
+    """
+    now = time.time()
+    with transaction(path) as conn:
+        row = conn.execute(
+            "SELECT worker_id, epoch FROM leases WHERE job_id=?",
+            (lease.job_id,),
+        ).fetchone()
+        if row is None or row["worker_id"] != lease.worker_id or int(row["epoch"]) != lease.epoch:
+            return False
+        conn.execute(
+            "UPDATE workers SET heartbeat_at=?, status=? WHERE worker_id=?",
+            (now, status, worker_id),
+        )
         conn.execute("UPDATE leases SET heartbeat_at=? WHERE job_id=?", (now, lease.job_id))
         return True
 
